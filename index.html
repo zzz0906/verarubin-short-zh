@@ -1,0 +1,475 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Vera Rubin 原生 3-bit LLM 权重与 KV cache 的精度研究短版。">
+  <title>Vera Rubin 能否准确运行 3-bit LLM 推理？</title>
+  <style>
+    :root {
+      --paper: #f7f4eb;
+      --card: #fffdf7;
+      --ink: #24231f;
+      --muted: #6d695f;
+      --line: #ddd6c4;
+      --green: #176b5b;
+      --red: #9d3e32;
+      --gold: #9a731b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--paper);
+      color: var(--ink);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.55;
+    }
+    main { width: min(100% - 36px, 980px); margin: 0 auto; padding: 62px 0 54px; }
+    header { max-width: 850px; margin-bottom: 36px; }
+    .eyebrow {
+      color: var(--green);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: .11em;
+      text-transform: uppercase;
+    }
+    .lang-switch { float: right; margin-top: -2px; font-size: 13px; color: var(--muted); }
+    .lang-switch a { color: var(--green); font-weight: 750; text-decoration: none; }
+    h1 {
+      margin: 8px 0 14px;
+      font-family: Georgia, "Times New Roman", serif;
+      font-size: clamp(34px, 6vw, 58px);
+      line-height: 1.05;
+      letter-spacing: -.025em;
+      font-weight: 600;
+    }
+    .lead { font-size: clamp(18px, 2.4vw, 22px); line-height: 1.45; margin: 0; color: #3d3a33; }
+    .claim {
+      margin: 28px 0 0;
+      padding: 18px 20px;
+      border-left: 5px solid var(--green);
+      background: #eef5ef;
+      border-radius: 0 8px 8px 0;
+      font-size: 17px;
+    }
+    .claim strong { color: var(--green); }
+    section {
+      margin: 26px 0;
+      padding: 24px;
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+    }
+    h2 {
+      margin: 0 0 5px;
+      font-family: Georgia, "Times New Roman", serif;
+      font-size: 27px;
+      line-height: 1.25;
+    }
+    .question { margin: 0 0 18px; color: var(--muted); }
+    .mechanism {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 8px;
+      margin-top: 18px;
+      align-items: stretch;
+    }
+    .mechanism .step {
+      position: relative;
+      padding: 14px 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbf8ef;
+      font-size: 13px;
+    }
+    .mechanism .step:not(:last-child)::after {
+      content: "→";
+      position: absolute;
+      z-index: 2;
+      right: -10px;
+      top: 50%;
+      transform: translateY(-50%);
+      color: var(--gold);
+      font-weight: 900;
+      background: var(--card);
+    }
+    .mechanism b { display: block; margin-bottom: 4px; color: var(--green); }
+    .format {
+      margin-top: 17px;
+      padding: 14px 16px;
+      border-radius: 8px;
+      background: #f0ede3;
+      color: #49463e;
+      font-size: 14px;
+    }
+    .primitive {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-top: 16px;
+    }
+    .primitive > div {
+      padding: 15px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbf8ef;
+    }
+    .primitive b { display: block; color: var(--green); margin-bottom: 5px; }
+    .equation {
+      margin: 17px 0;
+      padding: 17px;
+      overflow-x: auto;
+      border-radius: 8px;
+      background: #242a27;
+      color: #f0f4ef;
+      font: 14px/1.7 "SFMono-Regular", Consolas, monospace;
+      white-space: nowrap;
+    }
+    .kernel-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+    .kernel-step {
+      padding: 14px 15px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbf8ef;
+      font-size: 14px;
+    }
+    .kernel-step b { color: var(--green); }
+    figure.original {
+      padding: 0;
+      border: 0;
+      background: transparent;
+    }
+    .iframe-shell {
+      margin-top: 12px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      background: var(--paper);
+    }
+    .figure-frame {
+      display: block;
+      width: 100%;
+      height: 760px;
+      border: 0;
+      background: var(--paper);
+    }
+    .figure-frame.kv-frame { height: 1020px; }
+    .embed-note { margin: 8px 2px 0; color: var(--muted); font-size: 12px; }
+    .algo-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin: 14px 0 18px; }
+    .algo {
+      padding: 14px 15px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbf8ef;
+      font-size: 14px;
+    }
+    .algo b { color: var(--green); }
+    figure {
+      margin: 20px 0 0;
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #fffef9;
+    }
+    figcaption { margin-bottom: 13px; }
+    .fig-label {
+      display: block;
+      color: var(--gold);
+      font-size: 11px;
+      font-weight: 850;
+      letter-spacing: .09em;
+      text-transform: uppercase;
+    }
+    .fig-title { display: block; margin-top: 2px; font-family: Georgia, "Times New Roman", serif; font-size: 20px; }
+    .legend { display: flex; gap: 16px; margin: 8px 0 13px; color: var(--muted); font-size: 12px; }
+    .dot { display: inline-block; width: 9px; height: 9px; margin-right: 5px; border-radius: 50%; }
+    .dot.good-dot { background: var(--green); }
+    .dot.bad-dot { background: var(--red); }
+    .ratio-chart { display: grid; gap: 12px; }
+    .ratio-row { display: grid; grid-template-columns: 150px 1fr; gap: 12px; align-items: center; }
+    .ratio-model { font-size: 13px; font-weight: 750; }
+    .ratio-bars { display: grid; gap: 5px; }
+    .track { height: 20px; border-radius: 5px; background: #ece7da; overflow: visible; }
+    .fill {
+      height: 100%;
+      min-width: 48px;
+      padding: 2px 7px;
+      border-radius: 5px;
+      color: white;
+      font-size: 11px;
+      font-weight: 800;
+      white-space: nowrap;
+    }
+    .fill.good-bar { background: var(--green); }
+    .fill.bad-bar { background: var(--red); }
+    .axis { margin: 8px 0 0 162px; display: flex; justify-content: space-between; color: var(--muted); font-size: 10px; }
+    .kv-story { display: grid; grid-template-columns: 1fr auto 1fr auto 1fr; gap: 10px; align-items: stretch; }
+    .kv-box { padding: 14px; border: 1px solid var(--line); border-radius: 8px; text-align: center; }
+    .kv-box b { display: block; font-size: 21px; font-family: Georgia, "Times New Roman", serif; }
+    .kv-box.good-box { border-color: #88b4aa; background: #f0f7f3; }
+    .kv-box.bad-box { border-color: #d5a29c; background: #fbf0ee; }
+    .arrow { align-self: center; color: var(--gold); font-size: 21px; font-weight: 900; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { padding: 11px 10px; border-bottom: 1px solid #e9e3d4; text-align: right; white-space: nowrap; }
+    th:first-child, td:first-child { text-align: left; white-space: normal; }
+    th {
+      color: var(--muted);
+      font-size: 11px;
+      letter-spacing: .055em;
+      text-transform: uppercase;
+    }
+    tr:last-child td { border-bottom: 0; }
+    .good { color: var(--green); font-weight: 750; }
+    .bad { color: var(--red); font-weight: 750; }
+    .note { margin: 14px 0 0; color: var(--muted); font-size: 14px; }
+    .result {
+      margin-top: 16px;
+      padding-top: 14px;
+      border-top: 1px solid var(--line);
+      font-weight: 650;
+    }
+    code {
+      padding: 1px 5px;
+      border-radius: 4px;
+      background: #eee9dc;
+      font-size: .9em;
+      overflow-wrap: anywhere;
+    }
+    .proof { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 16px; }
+    .proof div { padding: 15px; border: 1px solid var(--line); border-radius: 8px; }
+    .proof b { display: block; margin-bottom: 4px; color: var(--green); }
+    footer { color: var(--muted); font-size: 14px; padding-top: 6px; }
+    footer a { color: var(--green); font-weight: 700; }
+    .scope { font-size: 16px; }
+    @media (max-width: 720px) {
+      main { padding-top: 34px; }
+      section { padding: 18px; }
+      .proof { grid-template-columns: 1fr; }
+      .mechanism { grid-template-columns: 1fr; }
+      .mechanism .step:not(:last-child)::after { content: "↓"; top: auto; bottom: -14px; right: 50%; transform: translateX(50%); }
+      .primitive, .kernel-grid { grid-template-columns: 1fr; }
+      .algo-grid { grid-template-columns: 1fr; }
+      .ratio-row { grid-template-columns: 1fr; gap: 5px; }
+      .axis { margin-left: 0; }
+      .kv-story { grid-template-columns: 1fr; }
+      .arrow { transform: rotate(90deg); justify-self: center; }
+      .figure-frame { height: 1600px; }
+      .figure-frame.kv-frame { height: 2100px; }
+      th, td { padding: 9px 7px; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="lang-switch"><a href="https://www.zhongzhuzhou.org/verarubin-short/">English</a> · 中文</div>
+    <div class="eyebrow">Vera Rubin · 原生 LUT-B · 精度优先</div>
+    <h1>Vera Rubin 能否准确运行 3-bit LLM 推理？</h1>
+    <p class="lead">
+      我们只研究一个问题：Rubin 的原生 LUT-B 指令能否运行 3-bit 模型权重和
+      3-bit KV cache，同时不破坏模型质量？
+    </p>
+    <div class="claim">
+      <strong>答案是可以——但必须使用正确的量化算法。</strong>
+      经过校准的非均匀码本与 scale 能把质量损失控制在合理范围；
+      朴素 3-bit 量化会使模型坍缩。决定 INT3 是否可用的是算法，而不只是位宽。
+    </div>
+  </header>
+
+  <section>
+    <h2>Rubin LUT-B 与我们的算法</h2>
+    <p class="question">
+      LUT-B 中的 “B” 指 <em>矩阵操作数 B</em>，不是位宽。
+      Rubin 保持 A 为 E4M3 矩阵，并在 Tensor Core MMA 内部重建压缩的 B。
+    </p>
+    <div class="primitive">
+      <div>
+        <b>Rubin 提供什么</b>
+        一条原生 <code>decompress::lut::b</code> MMA。每个 3-bit index 从 Tensor Memory 中的
+        8 个 E4M3 值里选择一个，因此不需要独立反量化 kernel，也不会生成稠密 B 张量。
+      </div>
+      <div>
+        <b>我们提供什么</b>
+        离线量化器决定 8 个码本值、每个元素的 index 和 scale layout；
+        runtime 则把模型权重或缓存 K/V 映射为压缩的 B 操作数。
+      </div>
+    </div>
+    <div class="mechanism">
+      <div class="step"><b>1 · 调整分布</b>按需旋转或缩放张量，削弱 outlier。</div>
+      <div class="step"><b>2 · 拟合码本</b>为每个 tile 学习 8 个 E4M3 重建值。</div>
+      <div class="step"><b>3 · 保护误差</b>按需用 RMS²、Fisher 或 GPTQ 保护重要误差。</div>
+      <div class="step"><b>4 · 打包</b>保存 3-bit index、8 值 LUT 与 UE8M0 scale。</div>
+      <div class="step"><b>5 · 执行</b>Rubin 在 MMA 内查表恢复 B；A 保持 E4M3。</div>
+    </div>
+    <div class="format">
+      一个 K64×N8 tile 包含 512 个 3-bit index（192 B）、一个 8 项 E4M3 LUT（8 B）和 scale metadata，
+      合计约 <strong>3.2 bits/weight</strong>。原生路径不会物化稠密 BF16 权重。
+    </div>
+  </section>
+
+  <section>
+    <h2>Kernel 如何计算矩阵乘</h2>
+    <p class="question">
+      Kernel 仍然计算普通的 Y = A·B，但 B 只在每条 MMA 内部从 payload 重建。
+    </p>
+    <div class="equation">
+      B̂[k,n] = global × scaleB[t,n] × LUT[t][index[k,n]]<br>
+      Y[m,n] = Σₜ Dₜ[m,n] × scaleA[m,t] × scaleB[t,n] × global
+    </div>
+    <div class="kernel-grid">
+      <div class="kernel-step">
+        <b>1 · 切分 GEMM。</b>
+        一个 128-thread CTA 负责一个 M128×N8 输出 tile，并以 64 元素为一段遍历 K。
+        激活按 row/K block 量化为 E4M3 与一个 UE8M0 scale。
+      </div>
+      <div class="kernel-step">
+        <b>2 · 搬运 payload。</b>
+        3-bit index 被重排为指令要求的 256-byte shared-memory image；
+        对应的 8 值 LUT 与 A fragment 被放入 Tensor Memory。
+      </div>
+      <div class="kernel-step">
+        <b>3 · 发射原生 LUT-B。</b>
+        Kernel 执行 <code>tcgen05.mma…decompress::lut::b</code>。
+        硬件查表恢复 B 并累加 FP32 partial D；mbarrier 保证 MMA 完成后才读取 D。
+      </div>
+      <div class="kernel-step">
+        <b>4 · 应用 scale。</b>
+        Epilogue 把每个 partial 乘以 activation scale、weight scale 和 folded global scale。
+        two-K32 配方使用两遍 masked K64，因为这条指令不能直接执行 K32 LUT-B。
+      </div>
+    </div>
+    <p class="note">
+      集成方式很直接：Qwen/Gemma 替换文本 <code>nn.Linear</code>；MiniMax 替换 routed-expert
+      W13/W2 GEMM；KV attention 在 QK 与 PV 收缩中把压缩 Kᵀ 和 V 映射到 B。
+    </p>
+  </section>
+
+  <section>
+    <h2>实验一：3-bit 权重</h2>
+    <p class="question">原生 W3A8 能否在三种架构上保持语言模型质量？</p>
+    <div class="algo-grid">
+      <div class="algo">
+        <b>Qwen 与 Gemma：H64 + GPTQ。</b>
+        带符号的 K64 Hadamard rotation 打散权重 outlier；Lloyd–Max 拟合 8 个 LUT 值；
+        GPTQ 使用 block Hessian，把每次量化误差补偿到尚未量化的列。
+        Runtime 对 A 应用匹配的 H64 变换。
+      </div>
+      <div class="algo">
+        <b>MiniMax：RMS² 加权 Lloyd–Max。</b>
+        码本拟合按照校准激活的二阶矩给每个 channel 加权。
+        两个独立缩放的 K32 half 加一个 tensor-global scale 处理局部动态范围。
+        只量化 routed-expert 的 W13/W2 矩阵。
+      </div>
+    </div>
+    <p class="note">
+      SqueezeLLM 是另一种变体：它用 diagonal Fisher information 为同一个码本拟合加权。
+      除非显式组合两种方法，否则 SqueezeLLM 不执行 GPTQ 的逐列误差补偿。
+    </p>
+    <figure class="original">
+      <figcaption>
+        <span class="fig-label">Figure 1 · 原版交互式权重图</span>
+        <span class="fig-title">切换模型、上下文、方法、模拟、Rubin 原生实测与 MiniMax prod-KL</span>
+      </figcaption>
+      <div class="iframe-shell">
+        <iframe
+          class="figure-frame"
+          title="原版交互式 Figure 1：权重量化"
+          src="https://www.zhongzhuzhou.org/rubin-k3v3-zh/?embed=weight"
+          loading="eager">
+        </iframe>
+      </div>
+      <p class="embed-note">这是长版报告的原版 Figure 1；两个页面共用同一份实时数据。</p>
+    </figure>
+    <p class="note">
+      上图报告的量化 GEMM 全部通过 Rubin 原生 LUT-B MMA 执行。
+    </p>
+    <p class="result">结论：3-bit 权重可行，但朴素码本可能差几个数量级。</p>
+  </section>
+
+  <section>
+    <h2>实验二：3-bit KV cache</h2>
+    <p class="question">Qwen3-4B 能否使用原生 K3V3 cache 而不丢掉模型质量？</p>
+    <div class="algo-grid">
+      <div class="algo">
+        <b>Cache 只写一次。</b>
+        离线为每层拟合 8 值 Lloyd–Max 码本。Sink 与 recent tokens 保持 BF16；
+        更旧的 K/V 按 64-token chunk 封装为 3-bit index、LUT 值与 scale。
+      </div>
+      <div class="algo">
+        <b>通过 LUT-B 读取两次。</b>
+        E4M3 Q 乘压缩 Kᵀ，softmax 的 max/sum/normalization 保持 FP32，
+        E4M3 P 再乘压缩 V。Kᵀ 与 V 都是矩阵 B，因此 Rubin 在 MMA 内部解压。
+      </div>
+    </div>
+    <figure class="original">
+      <figcaption>
+        <span class="fig-label">Figure 2 · 原版交互式 KV 图</span>
+        <span class="fig-title">比较 BF16、uniform、Lloyd–Max、OSCAR、模拟、原生精度与 KV roofline</span>
+      </figcaption>
+      <div class="iframe-shell">
+        <iframe
+          class="figure-frame kv-frame"
+          title="原版交互式 Figure 2：KV cache 量化"
+          src="https://www.zhongzhuzhou.org/rubin-k3v3-zh/?embed=kv"
+          loading="lazy">
+        </iframe>
+      </div>
+      <p class="embed-note">这是长版报告的原版 Figure 2；交互与后续数据更新完全共享。</p>
+    </figure>
+    <p class="result">
+      结论：从 PPL 看，只要控制好码本与 scale，3-bit KV 就是可行的；
+      uniform INT3 不是可用 baseline。
+    </p>
+  </section>
+
+  <section>
+    <h2>为什么这些是真实 Rubin 结果</h2>
+    <div class="proof">
+      <div>
+        <b>物理 payload</b>
+        权重与缓存 K/V 以 3-bit index、8 值 E4M3 LUT 和 scale 存储，而不是稠密 BF16 张量。
+      </div>
+      <div>
+        <b>原生指令</b>
+        Kernel 发射 <code>tcgen05.mma…decompress::lut::b</code>；解压发生在 MMA 内部。
+      </div>
+      <div>
+        <b>没有模拟 fallback</b>
+        已发布 MiniMax 实测均为 <code>sim_fallback_gemms = 0</code>。模拟与硬件对排序和坍缩结论一致。
+      </div>
+    </div>
+  </section>
+
+  <section class="scope">
+    <h2>研究边界</h2>
+    <p>
+      这是一个<strong>精度研究</strong>，不是经过优化的吞吐声明。
+      当前 kernel 有意以正确性优先；更快的调度、batching 与 pipelining 属于后续工程，
+      不影响上面的质量结论。
+    </p>
+  </section>
+
+  <footer>
+    完整方法、上下文 sweep、kernel contract 与复现细节：
+    <a href="https://www.zhongzhuzhou.org/rubin-k3v3-zh/">中文技术报告</a>。
+  </footer>
+</main>
+<script>
+  document.querySelectorAll(".figure-frame").forEach((frame) => {
+    frame.addEventListener("load", () => {
+      try {
+        const doc = frame.contentDocument;
+        const resize = () => {
+          frame.style.height = Math.ceil(doc.documentElement.scrollHeight) + "px";
+        };
+        new ResizeObserver(resize).observe(doc.body);
+        resize();
+      } catch (_) {
+        // 非 production 同源环境使用 CSS 固定高度作为 fallback。
+      }
+    });
+  });
+</script>
+</body>
+</html>
