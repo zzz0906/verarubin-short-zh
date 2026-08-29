@@ -66,6 +66,12 @@
       font-size: 27px;
       line-height: 1.25;
     }
+    h3 {
+      margin: 24px 0 6px;
+      font-family: Georgia, "Times New Roman", serif;
+      font-size: 21px;
+      line-height: 1.3;
+    }
     .question { margin: 0 0 18px; color: var(--muted); }
     .mechanism {
       display: grid;
@@ -229,6 +235,10 @@
       border-top: 1px solid var(--line);
       font-weight: 650;
     }
+    .perf-note { color: var(--muted); font-size: 13px; margin: 10px 0 18px; }
+    .conclusions { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 18px; }
+    .conclusions div { padding: 16px; border-radius: 8px; background: #eef5ef; border-left: 4px solid var(--green); }
+    .conclusions b { display: block; color: var(--green); margin-bottom: 4px; }
     code {
       padding: 1px 5px;
       border-radius: 4px;
@@ -249,6 +259,7 @@
       .mechanism { grid-template-columns: 1fr; }
       .mechanism .step:not(:last-child)::after { content: "↓"; top: auto; bottom: -14px; right: 50%; transform: translateX(50%); }
       .primitive, .kernel-grid { grid-template-columns: 1fr; }
+      .conclusions { grid-template-columns: 1fr; }
       .algo-grid { grid-template-columns: 1fr; }
       .ratio-row { grid-template-columns: 1fr; gap: 5px; }
       .axis { margin-left: 0; }
@@ -306,10 +317,8 @@
       一个 K64×N8 tile 包含 512 个 3-bit index（192 B）、一个 8 项 E4M3 LUT（8 B）和 scale metadata，
       合计约 <strong>3.2 bits/weight</strong>。原生路径不会物化稠密 BF16 权重。
     </div>
-  </section>
 
-  <section>
-    <h2>Kernel 如何计算矩阵乘</h2>
+    <h3>Kernel 如何计算矩阵乘</h3>
     <p class="question">
       Kernel 仍然计算普通的 Y = A·B，但 B 只在每条 MMA 内部从 payload 重建。
     </p>
@@ -343,28 +352,38 @@
       集成方式很直接：Qwen/Gemma 替换文本 <code>nn.Linear</code>；MiniMax 替换 routed-expert
       W13/W2 GEMM；KV attention 在 QK 与 PV 收缩中把压缩 Kᵀ 和 V 映射到 B。
     </p>
+
+    <h3>这个 kernel 的主要挑战</h3>
+    <div class="kernel-grid">
+      <div class="kernel-step">
+        <b>只能解压 B。</b>
+        压缩矩阵必须是操作数 B。这会约束 attention schedule：
+        Q×Kᵀ 与 P×V 可以直接使用 LUT-B，把长 K/V 放在 A 的 schedule 则不行。
+      </div>
+      <div class="kernel-step">
+        <b>Scale 的位置。</b>
+        Activation 与 weight scale 会随 tile 变化。当前正确性 kernel 需要读回每个 FP32 partial 后再乘 scale，
+        因而不能让 partial 在整个 K loop 中一直留在 Tensor Memory。
+      </div>
+      <div class="kernel-step">
+        <b>Small-M 利用率。</b>
+        原生 M tile 有 128 行；batch-1 decode 或稀疏 routed expert 往往只有几个有效行。
+        生产性能需要 batching、expert gathering 或 persistent schedule。
+      </div>
+      <div class="kernel-step">
+        <b>two-K32 与同步。</b>
+        细粒度 K32 scale 需要两遍 masked K64。TMEM store、MMA、mbarrier 完成与 FP32 读取也必须正确排序；
+        当前 MiniMax 精度路径使用 launch blocking 保证确定性。
+      </div>
+    </div>
   </section>
 
   <section>
     <h2>实验一：3-bit 权重</h2>
-    <p class="question">原生 W3A8 能否在三种架构上保持语言模型质量？</p>
-    <div class="algo-grid">
-      <div class="algo">
-        <b>Qwen 与 Gemma：H64 + GPTQ。</b>
-        带符号的 K64 Hadamard rotation 打散权重 outlier；Lloyd–Max 拟合 8 个 LUT 值；
-        GPTQ 使用 block Hessian，把每次量化误差补偿到尚未量化的列。
-        Runtime 对 A 应用匹配的 H64 变换。
-      </div>
-      <div class="algo">
-        <b>MiniMax：RMS² 加权 Lloyd–Max。</b>
-        码本拟合按照校准激活的二阶矩给每个 channel 加权。
-        两个独立缩放的 K32 half 加一个 tensor-global scale 处理局部动态范围。
-        只量化 routed-expert 的 W13/W2 矩阵。
-      </div>
-    </div>
-    <p class="note">
-      SqueezeLLM 是另一种变体：它用 diagonal Fisher information 为同一个码本拟合加权。
-      除非显式组合两种方法，否则 SqueezeLLM 不执行 GPTQ 的逐列误差补偿。
+    <p class="question">
+      我们比较了 <strong>17 种量化配置</strong>，另加 BF16 与 A8 baseline，
+      覆盖 Qwen3-4B、Gemma4-12B、MiniMax-M3 和 8K/64K/128K 三种上下文。
+      核心问题是：算法选择能否让原生 W3A8 真正可用？
     </p>
     <figure class="original">
       <figcaption>
@@ -381,6 +400,30 @@
       </div>
       <p class="embed-note">这是长版报告的原版 Figure 1；两个页面共用同一份实时数据。</p>
     </figure>
+
+    <h3>对比算法分别做什么</h3>
+    <div class="algo-grid">
+      <div class="algo">
+        <b>Lloyd–Max / uniform / NF3。</b>
+        Uniform 把 8 个值均匀排开；NF3 使用固定的正态分布码本；
+        Lloyd–Max 针对每个 tile 学习 8 个质心，用来判断“拟合码本”本身是否重要。
+      </div>
+      <div class="algo">
+        <b>RMS² / SqueezeLLM。</b>
+        RMS² 按 activation second moment 加权重建误差；
+        SqueezeLLM 使用 diagonal Fisher。两者都改变码本拟合，但都不是 GPTQ 误差补偿。
+      </div>
+      <div class="algo">
+        <b>GPTQ / inter-GPTQ。</b>
+        GPTQ 使用 block Hessian，把舍入误差推给尚未量化的列；
+        inter-GPTQ 则让补偿 sweep 与 8 值码本重拟合交替进行。
+      </div>
+      <div class="algo">
+        <b>H64 / AWQ / scale 变体。</b>
+        H64 用带符号 Hadamard 变换打散 outlier，并对 A 应用匹配变换；
+        AWQ 重缩放 activation channel 并把逆 scale fold 进权重；K64/two-K32/global 改变 scale 粒度。
+      </div>
+    </div>
     <p class="note">
       上图报告的量化 GEMM 全部通过 Rubin 原生 LUT-B MMA 执行。
     </p>
@@ -389,19 +432,10 @@
 
   <section>
     <h2>实验二：3-bit KV cache</h2>
-    <p class="question">Qwen3-4B 能否使用原生 K3V3 cache 而不丢掉模型质量？</p>
-    <div class="algo-grid">
-      <div class="algo">
-        <b>Cache 只写一次。</b>
-        离线为每层拟合 8 值 Lloyd–Max 码本。Sink 与 recent tokens 保持 BF16；
-        更旧的 K/V 按 64-token chunk 封装为 3-bit index、LUT 值与 scale。
-      </div>
-      <div class="algo">
-        <b>通过 LUT-B 读取两次。</b>
-        E4M3 Q 乘压缩 Kᵀ，softmax 的 max/sum/normalization 保持 FP32，
-        E4M3 P 再乘压缩 V。Kᵀ 与 V 都是矩阵 B，因此 Rubin 在 MMA 内部解压。
-      </div>
-    </div>
+    <p class="question">
+      Figure 2 比较 5 种 Qwen KV 配置（BF16 加 4 种压缩方案）和 3 种 Kimi latent-cache 配置。
+      它检验经过拟合的码本与受控 scale 能否在减少 cache traffic 的同时保持原生 K3V3 精度。
+    </p>
     <figure class="original">
       <figcaption>
         <span class="fig-label">Figure 2 · 原版交互式 KV 图</span>
@@ -417,10 +451,127 @@
       </div>
       <p class="embed-note">这是长版报告的原版 Figure 2；交互与后续数据更新完全共享。</p>
     </figure>
+
+    <h3>KV 算法分别做什么</h3>
+    <div class="algo-grid">
+      <div class="algo">
+        <b>Window 与 sealing。</b>
+        Sink 和 recent tokens 保持 BF16。更旧的 K/V 只封装一次，按 64-token chunk 存为
+        3-bit index、layer-specific LUT 和 scale；decode 不再改写它们。
+      </div>
+      <div class="algo">
+        <b>Lloyd–Max 码本。</b>
+        每层从校准数据学习 8 个非均匀值，把分辨率放在 K/V 真正出现的位置；
+        uniform 会把码字浪费在稀疏尾部并导致 PPL 坍缩。
+      </div>
+      <div class="algo">
+        <b>OSCAR。</b>
+        校准得到的 rotation 与 clipping 在拟合码本前打散 outlier。
+        它在部分模型上有益，但如果不能吸收到相邻 projection，就会引入 runtime transform。
+      </div>
+      <div class="algo">
+        <b>原生 attention 路径。</b>
+        E4M3 Q 乘压缩 Kᵀ；max、exp、sum 与 normalization 保持 FP32；
+        E4M3 P 再乘压缩 V。两次 cache 读取都使用 B-side LUT 解压。
+      </div>
+    </div>
     <p class="result">
       结论：从 PPL 看，只要控制好码本与 scale，3-bit KV 就是可行的；
       uniform INT3 不是可用 baseline。
     </p>
+  </section>
+
+  <section>
+    <h2>W3A8 与 K3V3 可能带来多少加速？</h2>
+    <p class="question">
+      下面是 kernel roofline 估算，不是端到端 serving 实测。
+      它把“少搬多少字节”的收益与复杂精度算法的 online 代价分开。
+    </p>
+
+    <h3>W3A8 weight-GEMM 估算</h3>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>原生权重路径</th>
+            <th>Payload</th>
+            <th>额外 online 工作</th>
+            <th>Kernel 含义</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>单遍 K64 LUT-B</td>
+            <td>3.25 bit/W</td>
+            <td>A8 量化之外无额外工作</td>
+            <td class="good">LUT-B rate 40–70% 时：2.49–4.35× Rubin BF16；16.3–28.6× H100 BF16</td>
+          </tr>
+          <tr>
+            <td>LM / RMS² / GPTQ / SqueezeLLM / inter-GPTQ</td>
+            <td>相同 K64 payload</td>
+            <td>码本、Fisher 与 Hessian 工作均在离线完成</td>
+            <td>保持单遍 envelope；byte ceiling 为 4.92× Rubin、32.3× H100</td>
+          </tr>
+          <tr>
+            <td>H64 + K64</td>
+            <td>3.25 bit/W</td>
+            <td>对 A 做带符号 H64 变换</td>
+            <td>基础 envelope 减去 rotation 代价；通常换来最大的精度收益</td>
+          </tr>
+          <tr>
+            <td>two-K32 scale oracle</td>
+            <td>3.375 bit/W</td>
+            <td>两遍 masked K64 MMA</td>
+            <td>2× MMA issue；当前原生评测 wall clock 约增加 10%</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="perf-note">
+      Folded AWQ 与 tensor-global scale 在支持 fold 时不增加 GEMM pass。
+      当前 correctness kernel 尚未优化，因此这里描述的是可达到的 kernel envelope，而不是当前 wall clock。
+    </p>
+
+    <h3>1M context 下的 K3V3 attention 估算</h3>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Qwen3-4B attention 路径</th>
+            <th>每请求 KV</th>
+            <th>Attention-only tok/s</th>
+            <th>相对 H100 BF16</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>H100 · BF16 KV</td><td>154.6 GB</td><td>21.7</td><td>1.00×</td></tr>
+          <tr><td>Rubin · BF16 KV</td><td>154.6 GB</td><td>142.3</td><td>6.57×</td></tr>
+          <tr><td>Rubin · K3V3，LUT-B rate 40%</td><td>30.2 GB</td><td class="good">353.7</td><td class="good">16.3×</td></tr>
+          <tr><td>Rubin · K3V3，LUT-B rate 55%</td><td>30.2 GB</td><td class="good">486.3</td><td class="good">22.4×</td></tr>
+          <tr><td>Rubin · K3V3，LUT-B rate 70%</td><td>30.2 GB</td><td class="good">619.0</td><td class="good">28.6×</td></tr>
+          <tr><td>Rubin · K3V3 byte ceiling</td><td>30.2 GB</td><td>727.6</td><td>33.6×</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="perf-note">
+      Qwen3-4B、36 层、GQA4、仅 attention。模型保留 320-token BF16 sink/recent window，
+      因此 1M cache 的有效位宽是 3.129 bit/value，而非恰好 3.125。
+      估算不含模型权重、MLP、sampling、通信和调度。Lloyd–Max 是纯离线；
+      OSCAR 若不能吸收到相邻 projection，会增加 rotation/clipping。
+    </p>
+
+    <div class="conclusions">
+      <div>
+        <b>结论一：W3A8</b>
+        大多数复杂精度算法都在离线完成，并保留单遍 K64 kernel。
+        H64 需要 A transform；two-K32 需要第二遍 MMA。
+      </div>
+      <div>
+        <b>结论二：K3V3</b>
+        拟合码本并控制 scale，可把 1M KV cache 从 154.6 GB 降到 30.2 GB。
+        实际速度随后取决于 LUT-B rate 与 small-M schedule，而不需要额外反量化 pass。
+      </div>
+    </div>
   </section>
 
   <section>
